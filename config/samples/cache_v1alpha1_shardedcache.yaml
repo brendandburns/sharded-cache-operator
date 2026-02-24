@@ -1,0 +1,19 @@
+---
+apiVersion: cache.operators.io/v1alpha1
+kind: ShardedCache
+metadata:
+  name: redis-shards
+  namespace: default
+spec:
+  # Number of cache shards. Each shard is individually addressable via
+  # <name>-<ordinal>.<name>.<namespace>.svc.cluster.local
+  replicas: 3
+  # Container image for each shard pod.
+  image: redis:7
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi

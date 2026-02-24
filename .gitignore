@@ -1,0 +1,9 @@
+# Build output
+bin/
+cover.out
+
+# Test cache
+testdata/
+
+# macOS
+.DS_Store
