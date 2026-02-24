@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -18,6 +19,10 @@ import (
 
 	cachev1alpha1 "github.com/brendandburns/sharded-cache-operator/api/v1alpha1"
 )
+
+// defaultCacheImage is the container image used for every cache shard.
+// Users never need to specify an image; the operator manages this detail.
+const defaultCacheImage = "redis:7"
 
 // ShardedCacheReconciler watches ShardedCache objects and keeps child resources in sync.
 type ShardedCacheReconciler struct {
@@ -52,7 +57,7 @@ func (r *ShardedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	lgr.Info("reconciled", "shards", sc.Spec.Replicas, "ready", sts.Status.ReadyReplicas)
+	lgr.Info("reconciled", "shards", sc.Spec.Shards, "ready", sts.Status.ReadyReplicas)
 	return ctrl.Result{}, r.refreshStatus(ctx, sc, sts)
 }
 
@@ -115,14 +120,14 @@ func (r *ShardedCacheReconciler) upsertAvailableCondition(sc *cachev1alpha1.Shar
 		ObservedGeneration: sc.Generation,
 		LastTransitionTime: metav1.Now(),
 	}
-	if sc.Status.ReadyReplicas >= sc.Spec.Replicas {
+	if sc.Status.ReadyReplicas >= sc.Spec.Shards {
 		newCond.Status = metav1.ConditionTrue
 		newCond.Reason = "AllShardsReady"
-		newCond.Message = fmt.Sprintf("all %d shard(s) are ready", sc.Spec.Replicas)
+		newCond.Message = fmt.Sprintf("all %d shard(s) are ready", sc.Spec.Shards)
 	} else {
 		newCond.Status = metav1.ConditionFalse
 		newCond.Reason = "ShardsNotReady"
-		newCond.Message = fmt.Sprintf("%d/%d shard(s) ready", sc.Status.ReadyReplicas, sc.Spec.Replicas)
+		newCond.Message = fmt.Sprintf("%d/%d shard(s) ready", sc.Status.ReadyReplicas, sc.Spec.Shards)
 	}
 	for i, c := range sc.Status.Conditions {
 		if c.Type != newCond.Type {
@@ -170,7 +175,7 @@ func (r *ShardedCacheReconciler) buildHeadlessService(sc *cachev1alpha1.ShardedC
 // buildStatefulSet returns the StatefulSet spec for sc.
 func (r *ShardedCacheReconciler) buildStatefulSet(sc *cachev1alpha1.ShardedCache) *appsv1.StatefulSet {
 	lbls := shardLabels(sc)
-	n := sc.Spec.Replicas
+	n := sc.Spec.Shards
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: sc.Name, Namespace: sc.Namespace, Labels: lbls},
 		Spec: appsv1.StatefulSetSpec{
@@ -182,8 +187,8 @@ func (r *ShardedCacheReconciler) buildStatefulSet(sc *cachev1alpha1.ShardedCache
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
 						Name:      "cache",
-						Image:     sc.Spec.Image,
-						Resources: sc.Spec.Resources,
+						Image:     defaultCacheImage,
+						Resources: resourcesForSize(sc.Spec.Size),
 						Ports: []corev1.ContainerPort{{
 							Name:          "cache",
 							ContainerPort: 6379,
@@ -202,7 +207,7 @@ func (r *ShardedCacheReconciler) statefulSetDrifted(current, desired *appsv1.Sta
 		return true
 	}
 	cc, dc := current.Spec.Template.Spec.Containers[0], desired.Spec.Template.Spec.Containers[0]
-	return cc.Image != dc.Image || !equality.Semantic.DeepEqual(cc.Resources, dc.Resources)
+	return !equality.Semantic.DeepEqual(cc.Resources, dc.Resources)
 }
 
 // shardLabels returns labels applied to all child resources of sc.
@@ -211,5 +216,46 @@ func shardLabels(sc *cachev1alpha1.ShardedCache) map[string]string {
 		"app.kubernetes.io/managed-by": "sharded-cache-operator",
 		"app.kubernetes.io/name":       "sharded-cache",
 		"app.kubernetes.io/instance":   sc.Name,
+	}
+}
+
+// resourcesForSize maps a CacheSize tier to concrete CPU and memory
+// requests/limits. This is the single place where the operator translates
+// the user-visible size knob into Kubernetes resource quantities.
+func resourcesForSize(s cachev1alpha1.CacheSize) corev1.ResourceRequirements {
+	switch s {
+	case cachev1alpha1.CacheSizeMedium:
+		return corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceMemory: resource.MustParse("256Mi"),
+			},
+		}
+	case cachev1alpha1.CacheSizeLarge:
+		return corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceMemory: resource.MustParse("256Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("1"),
+				corev1.ResourceMemory: resource.MustParse("512Mi"),
+			},
+		}
+	default: // CacheSizeSmall and any unset value
+		return corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("50m"),
+				corev1.ResourceMemory: resource.MustParse("64Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+		}
 	}
 }

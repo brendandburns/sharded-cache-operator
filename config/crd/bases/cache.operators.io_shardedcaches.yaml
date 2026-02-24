@@ -15,9 +15,12 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.replicas
-      name: Replicas
+    - jsonPath: .spec.shards
+      name: Shards
       type: integer
+    - jsonPath: .spec.size
+      name: Size
+      type: string
     - jsonPath: .status.readyReplicas
       name: Ready
       type: integer
@@ -27,8 +30,9 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: ShardedCache is the Schema for the shardedcaches API. It represents
-          a horizontally sharded cache deployment.
+        description: ShardedCache deploys a horizontally sharded cache. Users only
+          need to choose how many shards to run and how large each shard should be;
+          all other implementation details are managed by the operator.
         properties:
           apiVersion:
             type: string
@@ -39,39 +43,23 @@ spec:
           spec:
             description: ShardedCacheSpec defines the desired state of a ShardedCache.
             properties:
-              image:
-                description: Image is the container image used for each cache shard.
-                minLength: 1
-                type: string
-              replicas:
+              shards:
                 default: 1
-                description: Replicas is the number of cache shards to deploy.
+                description: Shards is the number of independent cache shards to run.
+                  Each shard holds a distinct slice of the key space and is individually
+                  addressable via its stable DNS name.
                 format: int32
                 minimum: 1
                 type: integer
-              resources:
-                description: Resources describes the compute resource requirements.
-                properties:
-                  limits:
-                    additionalProperties:
-                      anyOf:
-                      - type: integer
-                      - type: string
-                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                      x-kubernetes-int-or-string: true
-                    type: object
-                  requests:
-                    additionalProperties:
-                      anyOf:
-                      - type: integer
-                      - type: string
-                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                      x-kubernetes-int-or-string: true
-                    type: object
-                type: object
-            required:
-            - image
-            - replicas
+              size:
+                default: small
+                description: Size controls the compute resources allocated to each
+                  shard. Accepted values are "small", "medium", and "large".
+                enum:
+                - small
+                - medium
+                - large
+                type: string
             type: object
           status:
             description: ShardedCacheStatus defines the observed state of a ShardedCache.
@@ -108,7 +96,8 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               readyReplicas:
-                description: ReadyReplicas is the number of cache shard pods that are ready.
+                description: ReadyReplicas is the number of cache shard pods that are
+                  ready.
                 format: int32
                 type: integer
             type: object
