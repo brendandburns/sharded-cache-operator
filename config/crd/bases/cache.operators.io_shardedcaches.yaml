@@ -1,0 +1,140 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
+  name: shardedcaches.cache.operators.io
+spec:
+  group: cache.operators.io
+  names:
+    kind: ShardedCache
+    listKind: ShardedCacheList
+    plural: shardedcaches
+    singular: shardedcache
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.shards
+      name: Shards
+      type: integer
+    - jsonPath: .spec.size
+      name: Size
+      type: string
+    - jsonPath: .status.readyReplicas
+      name: Ready
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ShardedCache deploys a horizontally sharded cache in front of
+          a Kubernetes workload. Users choose how many shards to run, how large each
+          shard should be, and optionally which upstream Service/Ingress/Gateway to
+          forward traffic to. All other implementation details are managed by the
+          operator.
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ShardedCacheSpec defines the desired state of a ShardedCache.
+            properties:
+              backend:
+                description: Backend identifies the upstream Kubernetes resource (Service,
+                  Ingress, or Gateway) that the cache should forward traffic to on
+                  a cache miss. The operator exposes the resolved upstream address
+                  to the cache container via the CACHE_UPSTREAM environment variable.
+                properties:
+                  kind:
+                    default: Service
+                    description: Kind is the type of the backend resource. Supported
+                      values are Service, Ingress, and Gateway.
+                    enum:
+                    - Service
+                    - Ingress
+                    - Gateway
+                    type: string
+                  name:
+                    description: Name is the name of the backend resource.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: Namespace of the backend resource. Defaults to the
+                      same namespace as the ShardedCache.
+                    type: string
+                  port:
+                    description: Port on the backend Service to forward traffic to.
+                      Required when Kind is "Service"; ignored for Ingress and Gateway.
+                      Defaults to 80 when omitted for a Service.
+                    format: int32
+                    type: integer
+                required:
+                - name
+                type: object
+              shards:
+                default: 1
+                description: Shards is the number of independent cache shards to run.
+                format: int32
+                minimum: 1
+                type: integer
+              size:
+                default: small
+                description: Size controls the compute resources allocated to each
+                  shard. Accepted values are "small", "medium", and "large".
+                enum:
+                - small
+                - medium
+                - large
+                type: string
+            type: object
+          status:
+            description: ShardedCacheStatus defines the observed state of a ShardedCache.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      format: date-time
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              readyReplicas:
+                description: ReadyReplicas is the number of cache shard pods that
+                  are ready.
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
