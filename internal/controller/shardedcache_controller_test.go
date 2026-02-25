@@ -281,3 +281,132 @@ func TestReconcile_LabelsApplied(t *testing.T) {
 		t.Errorf("Service label app.kubernetes.io/managed-by = %q", v)
 	}
 }
+
+// TestReconcile_BackendServiceEnvVar validates that when spec.backend is set
+// to a Service, the CACHE_UPSTREAM environment variable is injected into the
+// cache container with the correct cluster-local URL.
+func TestReconcile_BackendServiceEnvVar(t *testing.T) {
+	const (
+		name = "backendtest"
+		ns   = "default"
+		port = int32(8080)
+	)
+	sc := sampleSC(name, ns, 1, cachev1alpha1.CacheSizeSmall)
+	sc.Spec.Backend = &cachev1alpha1.BackendRef{
+		Kind: cachev1alpha1.BackendKindService,
+		Name: "my-app",
+		Port: func() *int32 { p := port; return &p }(),
+	}
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(sc).WithObjects(sc).Build()
+	r := &controller.ShardedCacheReconciler{Client: c, Scheme: scheme}
+	key := types.NamespacedName{Name: name, Namespace: ns}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var sts appsv1.StatefulSet
+	if err := c.Get(context.Background(), key, &sts); err != nil {
+		t.Fatalf("StatefulSet not found: %v", err)
+	}
+	env := sts.Spec.Template.Spec.Containers[0].Env
+	var upstream string
+	for _, e := range env {
+		if e.Name == "CACHE_UPSTREAM" {
+			upstream = e.Value
+			break
+		}
+	}
+	want := "http://my-app.default.svc.cluster.local:8080"
+	if upstream != want {
+		t.Errorf("CACHE_UPSTREAM = %q, want %q", upstream, want)
+	}
+}
+
+// TestReconcile_NoBackendNoEnvVar validates that when spec.backend is absent
+// no CACHE_UPSTREAM env var is injected into the cache container.
+func TestReconcile_NoBackendNoEnvVar(t *testing.T) {
+	const (
+		name = "nobackend"
+		ns   = "default"
+	)
+	sc := sampleSC(name, ns, 1, cachev1alpha1.CacheSizeSmall)
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(sc).WithObjects(sc).Build()
+	r := &controller.ShardedCacheReconciler{Client: c, Scheme: scheme}
+	key := types.NamespacedName{Name: name, Namespace: ns}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var sts appsv1.StatefulSet
+	if err := c.Get(context.Background(), key, &sts); err != nil {
+		t.Fatalf("StatefulSet not found: %v", err)
+	}
+	for _, e := range sts.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "CACHE_UPSTREAM" {
+			t.Errorf("unexpected CACHE_UPSTREAM env var when no backend is set")
+		}
+	}
+}
+
+// TestReconcile_BackendChangeUpdatesEnvVar validates that changing spec.backend
+// causes the StatefulSet pod template to be updated on the next reconcile.
+func TestReconcile_BackendChangeUpdatesEnvVar(t *testing.T) {
+	const (
+		name = "backendchange"
+		ns   = "default"
+	)
+	port := int32(9000)
+	sc := sampleSC(name, ns, 1, cachev1alpha1.CacheSizeSmall)
+	sc.Spec.Backend = &cachev1alpha1.BackendRef{
+		Kind: cachev1alpha1.BackendKindService,
+		Name: "svc-a",
+		Port: &port,
+	}
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(sc).WithObjects(sc).Build()
+	r := &controller.ShardedCacheReconciler{Client: c, Scheme: scheme}
+	key := types.NamespacedName{Name: name, Namespace: ns}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+
+	// Update backend to point to a different service.
+	var live cachev1alpha1.ShardedCache
+	if err := c.Get(context.Background(), key, &live); err != nil {
+		t.Fatalf("Get ShardedCache: %v", err)
+	}
+	newPort := int32(9001)
+	live.Spec.Backend = &cachev1alpha1.BackendRef{
+		Kind: cachev1alpha1.BackendKindService,
+		Name: "svc-b",
+		Port: &newPort,
+	}
+	if err := c.Update(context.Background(), &live); err != nil {
+		t.Fatalf("Update ShardedCache: %v", err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+
+	var sts appsv1.StatefulSet
+	if err := c.Get(context.Background(), key, &sts); err != nil {
+		t.Fatalf("StatefulSet not found: %v", err)
+	}
+	var upstream string
+	for _, e := range sts.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "CACHE_UPSTREAM" {
+			upstream = e.Value
+			break
+		}
+	}
+	want := "http://svc-b.default.svc.cluster.local:9001"
+	if upstream != want {
+		t.Errorf("CACHE_UPSTREAM after update = %q, want %q", upstream, want)
+	}
+}

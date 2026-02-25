@@ -30,9 +30,11 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: ShardedCache deploys a horizontally sharded cache. Users only
-          need to choose how many shards to run and how large each shard should be;
-          all other implementation details are managed by the operator.
+        description: ShardedCache deploys a horizontally sharded cache in front of
+          a Kubernetes workload. Users choose how many shards to run, how large each
+          shard should be, and optionally which upstream Service/Ingress/Gateway to
+          forward traffic to. All other implementation details are managed by the
+          operator.
         properties:
           apiVersion:
             type: string
@@ -43,11 +45,41 @@ spec:
           spec:
             description: ShardedCacheSpec defines the desired state of a ShardedCache.
             properties:
+              backend:
+                description: Backend identifies the upstream Kubernetes resource (Service,
+                  Ingress, or Gateway) that the cache should forward traffic to on
+                  a cache miss. The operator exposes the resolved upstream address
+                  to the cache container via the CACHE_UPSTREAM environment variable.
+                properties:
+                  kind:
+                    default: Service
+                    description: Kind is the type of the backend resource. Supported
+                      values are Service, Ingress, and Gateway.
+                    enum:
+                    - Service
+                    - Ingress
+                    - Gateway
+                    type: string
+                  name:
+                    description: Name is the name of the backend resource.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: Namespace of the backend resource. Defaults to the
+                      same namespace as the ShardedCache.
+                    type: string
+                  port:
+                    description: Port on the backend Service to forward traffic to.
+                      Required when Kind is "Service"; ignored for Ingress and Gateway.
+                      Defaults to 80 when omitted for a Service.
+                    format: int32
+                    type: integer
+                required:
+                - name
+                type: object
               shards:
                 default: 1
                 description: Shards is the number of independent cache shards to run.
-                  Each shard holds a distinct slice of the key space and is individually
-                  addressable via its stable DNS name.
                 format: int32
                 minimum: 1
                 type: integer
@@ -96,8 +128,8 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               readyReplicas:
-                description: ReadyReplicas is the number of cache shard pods that are
-                  ready.
+                description: ReadyReplicas is the number of cache shard pods that
+                  are ready.
                 format: int32
                 type: integer
             type: object

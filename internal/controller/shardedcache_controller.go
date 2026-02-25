@@ -52,6 +52,13 @@ func (r *ShardedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
+	if sc.Spec.Backend != nil &&
+		(sc.Spec.Backend.Kind == cachev1alpha1.BackendKindService || sc.Spec.Backend.Kind == "") &&
+		sc.Spec.Backend.Port == nil {
+		lgr.Info("backend kind is Service but no port specified; assuming port 80",
+			"backend", sc.Spec.Backend.Name)
+	}
+
 	sts, err := r.applyStatefulSet(ctx, sc)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -176,6 +183,7 @@ func (r *ShardedCacheReconciler) buildHeadlessService(sc *cachev1alpha1.ShardedC
 func (r *ShardedCacheReconciler) buildStatefulSet(sc *cachev1alpha1.ShardedCache) *appsv1.StatefulSet {
 	lbls := shardLabels(sc)
 	n := sc.Spec.Shards
+	env := upstreamEnv(sc)
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: sc.Name, Namespace: sc.Namespace, Labels: lbls},
 		Spec: appsv1.StatefulSetSpec{
@@ -188,6 +196,7 @@ func (r *ShardedCacheReconciler) buildStatefulSet(sc *cachev1alpha1.ShardedCache
 					Containers: []corev1.Container{{
 						Name:      "cache",
 						Image:     defaultCacheImage,
+						Env:       env,
 						Resources: resourcesForSize(sc.Spec.Size),
 						Ports: []corev1.ContainerPort{{
 							Name:          "cache",
@@ -207,7 +216,8 @@ func (r *ShardedCacheReconciler) statefulSetDrifted(current, desired *appsv1.Sta
 		return true
 	}
 	cc, dc := current.Spec.Template.Spec.Containers[0], desired.Spec.Template.Spec.Containers[0]
-	return !equality.Semantic.DeepEqual(cc.Resources, dc.Resources)
+	return !equality.Semantic.DeepEqual(cc.Resources, dc.Resources) ||
+		!equality.Semantic.DeepEqual(cc.Env, dc.Env)
 }
 
 // shardLabels returns labels applied to all child resources of sc.
@@ -257,5 +267,40 @@ func resourcesForSize(s cachev1alpha1.CacheSize) corev1.ResourceRequirements {
 				corev1.ResourceMemory: resource.MustParse("128Mi"),
 			},
 		}
+	}
+}
+
+// upstreamEnv returns the environment variables that expose the backend
+// upstream address to the cache container. If no backend is configured an
+// empty slice is returned.
+func upstreamEnv(sc *cachev1alpha1.ShardedCache) []corev1.EnvVar {
+	url := upstreamURL(sc)
+	if url == "" {
+		return nil
+	}
+	return []corev1.EnvVar{{Name: "CACHE_UPSTREAM", Value: url}}
+}
+
+// upstreamURL derives a cluster-local URL string from sc.Spec.Backend.
+// Returns an empty string when Backend is nil.
+func upstreamURL(sc *cachev1alpha1.ShardedCache) string {
+	b := sc.Spec.Backend
+	if b == nil {
+		return ""
+	}
+	ns := b.Namespace
+	if ns == "" {
+		ns = sc.Namespace
+	}
+	switch b.Kind {
+	case cachev1alpha1.BackendKindIngress:
+		return fmt.Sprintf("http://%s.%s", b.Name, ns)
+	case cachev1alpha1.BackendKindGateway:
+		return fmt.Sprintf("http://%s.%s", b.Name, ns)
+	default: // BackendKindService (and empty/default)
+		if b.Port != nil {
+			return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", b.Name, ns, *b.Port)
+		}
+		return fmt.Sprintf("http://%s.%s.svc.cluster.local", b.Name, ns)
 	}
 }

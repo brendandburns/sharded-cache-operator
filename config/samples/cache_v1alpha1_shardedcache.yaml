@@ -11,3 +11,9 @@ spec:
   # Compute tier for each shard: small | medium | large
   # Defaults to small. The operator picks the cache software and version.
   size: medium
+  # Upstream backend: the Service, Ingress, or Gateway the cache sits in front of.
+  # The resolved address is injected as CACHE_UPSTREAM into the cache container.
+  backend:
+    kind: Service   # Service | Ingress | Gateway
+    name: my-app    # name of the backend resource
+    port: 8080      # port on the backend Service (required for Service kind)
