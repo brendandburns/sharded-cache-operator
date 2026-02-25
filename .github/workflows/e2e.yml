@@ -1,0 +1,78 @@
+name: E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: End-to-end tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.10.0
+
+      - name: Build controller image
+        run: docker build -t controller:latest .
+
+      - name: Load image into kind
+        run: kind load docker-image controller:latest
+
+      - name: Install CRD
+        run: kubectl apply -f config/crd/bases/
+
+      - name: Deploy operator
+        run: |
+          kubectl create namespace sharded-cache-operator-system
+          kubectl apply -f config/rbac/
+          kubectl apply -f config/manager/serviceaccount.yaml
+          kubectl apply -f config/manager/manager.yaml
+          # Use the locally loaded image instead of pulling from a registry
+          kubectl patch deployment sharded-cache-operator-controller-manager \
+            -n sharded-cache-operator-system \
+            --type=strategic \
+            -p '{"spec":{"template":{"spec":{"containers":[{"name":"manager","imagePullPolicy":"Never"}]}}}}'
+
+      - name: Wait for operator to be ready
+        run: |
+          kubectl rollout status deployment/sharded-cache-operator-controller-manager \
+            -n sharded-cache-operator-system --timeout=120s
+
+      - name: Create ShardedCache CR
+        run: |
+          kubectl apply -f - <<'EOF'
+          apiVersion: cache.operators.io/v1alpha1
+          kind: ShardedCache
+          metadata:
+            name: e2e-test
+            namespace: default
+          spec:
+            shards: 2
+            size: small
+          EOF
+
+      - name: Verify StatefulSet and Service are created
+        run: |
+          # Wait up to 60 s for the operator to create the StatefulSet
+          for i in $(seq 1 30); do
+            kubectl get statefulset e2e-test -n default 2>/dev/null && break
+            sleep 2
+          done
+          # Assert the StatefulSet exists with the correct shard count
+          kubectl get statefulset e2e-test -n default
+          REPLICAS=$(kubectl get statefulset e2e-test -n default -o jsonpath='{.spec.replicas}')
+          [ "$REPLICAS" = "2" ] || { echo "Expected 2 replicas, got $REPLICAS"; exit 1; }
+          # Assert the headless Service exists
+          kubectl get service e2e-test -n default
