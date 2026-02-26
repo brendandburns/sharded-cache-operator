@@ -23,12 +23,14 @@ jobs:
 
       - name: Create kind cluster
         uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: kind
 
       - name: Build controller image
         run: docker build -t controller:latest .
 
       - name: Load image into kind
-        run: kind load docker-image controller:latest
+        run: kind load docker-image controller:latest --name kind
 
       - name: Install CRD
         run: kubectl apply -f config/crd/bases/
