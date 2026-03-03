@@ -79,6 +79,86 @@ jobs:
           # Assert the headless Service exists
           kubectl get service e2e-test -n default
 
+      - name: Verify memcached image, port, and memory configuration
+        run: |
+          # Assert the container image is memcached:1
+          IMAGE=$(kubectl get statefulset e2e-test -n default \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          [ "$IMAGE" = "memcached:1" ] || { echo "Expected memcached:1, got $IMAGE"; exit 1; }
+          echo "Image OK: $IMAGE"
+
+          # Assert the container port is 11211
+          PORT=$(kubectl get statefulset e2e-test -n default \
+            -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}')
+          [ "$PORT" = "11211" ] || { echo "Expected port 11211, got $PORT"; exit 1; }
+          echo "Container port OK: $PORT"
+
+          # Assert the headless Service exposes port 11211
+          SVC_PORT=$(kubectl get service e2e-test -n default \
+            -o jsonpath='{.spec.ports[0].port}')
+          [ "$SVC_PORT" = "11211" ] || { echo "Expected service port 11211, got $SVC_PORT"; exit 1; }
+          echo "Service port OK: $SVC_PORT"
+
+          # Assert the memcached memory-limit arg (-m 64 for small size) is set
+          ARGS=$(kubectl get statefulset e2e-test -n default \
+            -o jsonpath='{.spec.template.spec.containers[0].args}')
+          echo "Memcached args: $ARGS"
+          echo "$ARGS" | grep -q -- '-m' || { echo "Expected -m memory arg in container args"; exit 1; }
+          echo "Memory arg OK"
+
+      - name: Wait for memcached pods to be ready
+        run: kubectl rollout status statefulset/e2e-test -n default --timeout=180s
+
+      - name: Validate memcached HTTP caching works
+        run: |
+          # Port-forward to the first shard in the background
+          kubectl port-forward -n default pod/e2e-test-0 11211:11211 &
+          PF_PID=$!
+          trap "kill $PF_PID 2>/dev/null || true" EXIT
+          # Give the port-forward time to establish
+          sleep 3
+
+          # Use Python to exercise the memcached text protocol, which is the
+          # same protocol clients use to store and retrieve cached HTTP responses.
+          python3 - <<'PYEOF'
+          import socket, sys, time
+
+          # Retry connecting in case the port-forward is still starting
+          for attempt in range(5):
+              try:
+                  s = socket.create_connection(('127.0.0.1', 11211), timeout=5)
+                  break
+              except OSError as e:
+                  print(f"Attempt {attempt + 1}: cannot connect to 127.0.0.1:11211 – {e}")
+                  time.sleep(2)
+          else:
+              print("Could not connect to memcached at 127.0.0.1:11211 after retries", file=sys.stderr)
+              sys.exit(1)
+
+          # Store an HTTP response body under a cache key (simulates HTTP caching).
+          # set <key> <flags> <expiry-seconds> <byte-count>
+          # flags=0 (no special client flags), expiry=60 s
+          payload = b"hello-from-cache"
+          cmd = f"set http-response-key 0 60 {len(payload)}\r\n".encode() + payload + b"\r\n"
+          s.sendall(cmd)
+          resp = s.recv(256)
+          if b"STORED" not in resp:
+              print(f"set failed – expected STORED, got: {resp!r}", file=sys.stderr)
+              sys.exit(1)
+          print(f"set: OK ({resp.strip()!r})")
+
+          # Retrieve the cached HTTP response and verify the value is intact.
+          s.sendall(b"get http-response-key\r\n")
+          data = s.recv(256)
+          if b"hello-from-cache" not in data:
+              print(f"get failed – expected cached value, got: {data!r}", file=sys.stderr)
+              sys.exit(1)
+          print("get: OK (cached value successfully retrieved)")
+
+          s.close()
+          print("Memcached HTTP caching: PASS")
+          PYEOF
+
       - name: Dump operator logs on failure
         if: failure()
         run: |
