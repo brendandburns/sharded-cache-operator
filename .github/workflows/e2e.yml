@@ -78,3 +78,11 @@ jobs:
           [ "$REPLICAS" = "2" ] || { echo "Expected 2 replicas, got $REPLICAS"; exit 1; }
           # Assert the headless Service exists
           kubectl get service e2e-test -n default
+
+      - name: Dump operator logs on failure
+        if: failure()
+        run: |
+          kubectl logs -l control-plane=controller-manager \
+            -n sharded-cache-operator-system --tail=100 || true
+          kubectl describe deployment sharded-cache-operator-controller-manager \
+            -n sharded-cache-operator-system || true
