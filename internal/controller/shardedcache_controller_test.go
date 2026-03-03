@@ -2,6 +2,7 @@ package controller_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -72,8 +73,8 @@ func TestReconcile_CreatesStatefulSetAndService(t *testing.T) {
 	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != shards {
 		t.Errorf("expected %d replicas, got %v", shards, sts.Spec.Replicas)
 	}
-	if got := sts.Spec.Template.Spec.Containers[0].Image; got != "memcached:1" {
-		t.Errorf("expected default image memcached:1, got %q", got)
+	if got := sts.Spec.Template.Spec.Containers[0].Image; got != "nginx:alpine" {
+		t.Errorf("expected default image nginx:alpine, got %q", got)
 	}
 
 	// Expect a headless Service.
@@ -83,6 +84,16 @@ func TestReconcile_CreatesStatefulSetAndService(t *testing.T) {
 	}
 	if svc.Spec.ClusterIP != "None" {
 		t.Errorf("expected headless Service (ClusterIP=None), got %q", svc.Spec.ClusterIP)
+	}
+
+	// Expect a nginx ConfigMap with HTTP proxy configuration.
+	var cm corev1.ConfigMap
+	cmKey := types.NamespacedName{Name: name + "-nginx-config", Namespace: ns}
+	if err := c.Get(context.Background(), cmKey, &cm); err != nil {
+		t.Fatalf("nginx ConfigMap not found: %v", err)
+	}
+	if _, ok := cm.Data["default.conf"]; !ok {
+		t.Error("nginx ConfigMap missing default.conf key")
 	}
 }
 
@@ -411,9 +422,9 @@ func TestReconcile_BackendChangeUpdatesEnvVar(t *testing.T) {
 	}
 }
 
-// TestReconcile_MemcachedPort validates that the headless Service and the
-// StatefulSet container both expose port 11211 (the memcached default).
-func TestReconcile_MemcachedPort(t *testing.T) {
+// TestReconcile_NginxPort validates that the headless Service and the
+// StatefulSet container both expose port 80 (the nginx HTTP default).
+func TestReconcile_NginxPort(t *testing.T) {
 	const (
 		name = "porttest"
 		ns   = "default"
@@ -432,8 +443,8 @@ func TestReconcile_MemcachedPort(t *testing.T) {
 	if err := c.Get(context.Background(), key, &svc); err != nil {
 		t.Fatalf("Service not found: %v", err)
 	}
-	if len(svc.Spec.Ports) == 0 || svc.Spec.Ports[0].Port != 11211 {
-		t.Errorf("Service port = %v, want 11211", svc.Spec.Ports)
+	if len(svc.Spec.Ports) == 0 || svc.Spec.Ports[0].Port != 80 {
+		t.Errorf("Service port = %v, want 80", svc.Spec.Ports)
 	}
 
 	var sts appsv1.StatefulSet
@@ -441,28 +452,103 @@ func TestReconcile_MemcachedPort(t *testing.T) {
 		t.Fatalf("StatefulSet not found: %v", err)
 	}
 	ctr := sts.Spec.Template.Spec.Containers[0]
-	if len(ctr.Ports) == 0 || ctr.Ports[0].ContainerPort != 11211 {
-		t.Errorf("container port = %v, want 11211", ctr.Ports)
+	if len(ctr.Ports) == 0 || ctr.Ports[0].ContainerPort != 80 {
+		t.Errorf("container port = %v, want 80", ctr.Ports)
 	}
 }
 
-// TestReconcile_MemcachedArgsForSize validates that each size tier produces
-// the correct -m (memory) argument for the memcached container.
-func TestReconcile_MemcachedArgsForSize(t *testing.T) {
-	tests := []struct {
-		size    cachev1alpha1.CacheSize
-		wantMem string
-	}{
-		{cachev1alpha1.CacheSizeSmall, "64"},
-		{cachev1alpha1.CacheSizeMedium, "128"},
-		{cachev1alpha1.CacheSizeLarge, "256"},
+// TestReconcile_NginxConfigMapCreated validates that a ConfigMap holding the
+// nginx proxy configuration is created alongside the StatefulSet and Service.
+func TestReconcile_NginxConfigMapCreated(t *testing.T) {
+	const (
+		name = "cmtest"
+		ns   = "default"
+	)
+	sc := sampleSC(name, ns, 1, cachev1alpha1.CacheSizeSmall)
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(sc).WithObjects(sc).Build()
+	r := &controller.ShardedCacheReconciler{Client: c, Scheme: scheme}
+	key := types.NamespacedName{Name: name, Namespace: ns}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
 	}
+
+	var cm corev1.ConfigMap
+	cmKey := types.NamespacedName{Name: name + "-nginx-config", Namespace: ns}
+	if err := c.Get(context.Background(), cmKey, &cm); err != nil {
+		t.Fatalf("ConfigMap %s not found: %v", cmKey, err)
+	}
+	conf, ok := cm.Data["default.conf"]
+	if !ok {
+		t.Fatal("ConfigMap missing default.conf key")
+	}
+	if conf == "" {
+		t.Error("default.conf content is empty")
+	}
+}
+
+// TestReconcile_NginxConfigContainsUpstream validates that when spec.backend is
+// set the nginx ConfigMap contains a proxy_pass directive targeting the upstream.
+func TestReconcile_NginxConfigContainsUpstream(t *testing.T) {
+	const (
+		name = "upstreamcm"
+		ns   = "default"
+		port = int32(8080)
+	)
+	sc := sampleSC(name, ns, 1, cachev1alpha1.CacheSizeSmall)
+	sc.Spec.Backend = &cachev1alpha1.BackendRef{
+		Kind: cachev1alpha1.BackendKindService,
+		Name: "my-app",
+		Port: func() *int32 { p := port; return &p }(),
+	}
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(sc).WithObjects(sc).Build()
+	r := &controller.ShardedCacheReconciler{Client: c, Scheme: scheme}
+	key := types.NamespacedName{Name: name, Namespace: ns}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var cm corev1.ConfigMap
+	cmKey := types.NamespacedName{Name: name + "-nginx-config", Namespace: ns}
+	if err := c.Get(context.Background(), cmKey, &cm); err != nil {
+		t.Fatalf("ConfigMap not found: %v", err)
+	}
+	conf := cm.Data["default.conf"]
+	wantUpstream := "http://my-app.default.svc.cluster.local:8080"
+	if !strings.Contains(conf, wantUpstream) {
+		t.Errorf("nginx config missing proxy_pass to %q\nconfig:\n%s", wantUpstream, conf)
+	}
+	if !strings.Contains(conf, "proxy_cache") {
+		t.Errorf("nginx config missing proxy_cache directive\nconfig:\n%s", conf)
+	}
+}
+
+// TestReconcile_NginxCacheSizeInConfig validates that each size tier produces a
+// different max_size value in the nginx proxy_cache_path directive.
+func TestReconcile_NginxCacheSizeInConfig(t *testing.T) {
+	tests := []struct {
+		size        cachev1alpha1.CacheSize
+		wantMaxSize string
+	}{
+		{cachev1alpha1.CacheSizeSmall, "max_size=64m"},
+		{cachev1alpha1.CacheSizeMedium, "max_size=128m"},
+		{cachev1alpha1.CacheSizeLarge, "max_size=256m"},
+	}
+	port := int32(9000)
 	for _, tt := range tests {
 		tt := tt
 		t.Run(string(tt.size), func(t *testing.T) {
-			name := "argstest-" + string(tt.size)
+			name := "sizecm-" + string(tt.size)
 			ns := "default"
 			sc := sampleSC(name, ns, 1, tt.size)
+			sc.Spec.Backend = &cachev1alpha1.BackendRef{
+				Kind: cachev1alpha1.BackendKindService,
+				Name: "svc",
+				Port: &port,
+			}
 			scheme := newScheme(t)
 			c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(sc).WithObjects(sc).Build()
 			r := &controller.ShardedCacheReconciler{Client: c, Scheme: scheme}
@@ -472,20 +558,14 @@ func TestReconcile_MemcachedArgsForSize(t *testing.T) {
 				t.Fatalf("Reconcile: %v", err)
 			}
 
-			var sts appsv1.StatefulSet
-			if err := c.Get(context.Background(), key, &sts); err != nil {
-				t.Fatalf("StatefulSet not found: %v", err)
+			var cm corev1.ConfigMap
+			cmKey := types.NamespacedName{Name: name + "-nginx-config", Namespace: ns}
+			if err := c.Get(context.Background(), cmKey, &cm); err != nil {
+				t.Fatalf("ConfigMap not found: %v", err)
 			}
-			args := sts.Spec.Template.Spec.Containers[0].Args
-			var gotMem string
-			for i, a := range args {
-				if a == "-m" && i+1 < len(args) {
-					gotMem = args[i+1]
-					break
-				}
-			}
-			if gotMem != tt.wantMem {
-				t.Errorf("size %s: memcached -m arg = %q, want %q", tt.size, gotMem, tt.wantMem)
+			conf := cm.Data["default.conf"]
+			if !strings.Contains(conf, tt.wantMaxSize) {
+				t.Errorf("size %s: expected %q in nginx config\nconfig:\n%s", tt.size, tt.wantMaxSize, conf)
 			}
 		})
 	}

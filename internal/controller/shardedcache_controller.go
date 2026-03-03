@@ -21,11 +21,13 @@ import (
 )
 
 // defaultCacheImage is the container image used for every cache shard.
-// Users never need to specify an image; the operator manages this detail.
-const defaultCacheImage = "memcached:1"
+// nginx:alpine acts as a transparent HTTP caching reverse proxy; it intercepts
+// every HTTP request, serves the response from its local cache when available,
+// and forwards cache-miss requests to the configured backend upstream.
+const defaultCacheImage = "nginx:alpine"
 
-// defaultCachePort is the port exposed by each cache shard container.
-const defaultCachePort = int32(11211)
+// defaultCachePort is the HTTP port exposed by each cache shard.
+const defaultCachePort = int32(80)
 
 // ShardedCacheReconciler watches ShardedCache objects and keeps child resources in sync.
 type ShardedCacheReconciler struct {
@@ -38,6 +40,7 @@ type ShardedCacheReconciler struct {
 // +kubebuilder:rbac:groups=cache.operators.io,resources=shardedcaches/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is invoked whenever a ShardedCache or one of its owned resources changes.
 func (r *ShardedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -49,6 +52,10 @@ func (r *ShardedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("get ShardedCache %s: %w", req, err)
+	}
+
+	if err := r.applyConfigMap(ctx, sc); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if err := r.applyHeadlessService(ctx, sc); err != nil {
@@ -69,6 +76,24 @@ func (r *ShardedCacheReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	lgr.Info("reconciled", "shards", sc.Spec.Shards, "ready", sts.Status.ReadyReplicas)
 	return ctrl.Result{}, r.refreshStatus(ctx, sc, sts)
+}
+
+// applyConfigMap reconciles the nginx ConfigMap that holds the HTTP proxy configuration.
+func (r *ShardedCacheReconciler) applyConfigMap(ctx context.Context, sc *cachev1alpha1.ShardedCache) error {
+	want := r.buildNginxConfigMap(sc)
+	if err := controllerutil.SetControllerReference(sc, want, r.Scheme); err != nil {
+		return err
+	}
+	got := &corev1.ConfigMap{}
+	switch err := r.Get(ctx, client.ObjectKeyFromObject(want), got); {
+	case apierrors.IsNotFound(err):
+		return r.Create(ctx, want)
+	case err != nil:
+		return err
+	}
+	patch := client.MergeFrom(got.DeepCopy())
+	got.Data = want.Data
+	return r.Patch(ctx, got, patch)
 }
 
 // applyHeadlessService reconciles the headless Service for the cache shards.
@@ -158,6 +183,7 @@ func (r *ShardedCacheReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&cachev1alpha1.ShardedCache{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
+		Owns(&corev1.ConfigMap{}).
 		Complete(r)
 }
 
@@ -182,11 +208,66 @@ func (r *ShardedCacheReconciler) buildHeadlessService(sc *cachev1alpha1.ShardedC
 	}
 }
 
+// buildNginxConfigMap returns the ConfigMap that holds the nginx HTTP proxy
+// configuration for the cache shards. The nginx server listens on port 80,
+// caches HTTP responses in /tmp/nginx-cache, and proxies cache-miss requests
+// to the backend upstream (when configured).
+func (r *ShardedCacheReconciler) buildNginxConfigMap(sc *cachev1alpha1.ShardedCache) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sc.Name + "-nginx-config",
+			Namespace: sc.Namespace,
+		},
+		Data: map[string]string{
+			"default.conf": nginxConfigForSize(sc.Spec.Size, upstreamURL(sc)),
+		},
+	}
+}
+
+// nginxConfigForSize returns the nginx default.conf content that configures
+// the shard as a transparent HTTP caching reverse proxy.
+// max_size is tuned to the size tier; proxy_pass targets the upstream URL when set.
+// When no upstream is set nginx returns 503 for all requests.
+func nginxConfigForSize(s cachev1alpha1.CacheSize, upstream string) string {
+	cacheSize := "64m"
+	switch s {
+	case cachev1alpha1.CacheSizeMedium:
+		cacheSize = "128m"
+	case cachev1alpha1.CacheSizeLarge:
+		cacheSize = "256m"
+	}
+	if upstream == "" {
+		return "server {\n    listen 80;\n    location / {\n        return 503 \"no backend service configured\\n\";\n    }\n}\n"
+	}
+	return fmt.Sprintf(
+		// proxy_cache_path: store cached objects under /tmp/nginx-cache.
+		// keys_zone=10m holds ~80 000 cache keys in shared memory.
+		// inactive=60m evicts entries not requested within 60 minutes.
+		// max_size is tuned to the ShardedCache size tier.
+		"proxy_cache_path /tmp/nginx-cache levels=1:2 keys_zone=http_cache:10m max_size=%s inactive=60m use_temp_path=off;\n\n"+
+			"server {\n"+
+			"    listen 80;\n"+
+			"    location / {\n"+
+			"        proxy_pass         %s;\n"+
+			"        proxy_cache        http_cache;\n"+
+			"        proxy_cache_methods GET HEAD;\n"+
+			"        proxy_cache_valid  200 302 10m;\n"+
+			"        proxy_cache_valid  404       1m;\n"+
+			"        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;\n"+
+			"        proxy_cache_lock   on;\n"+
+			"        add_header         X-Cache-Status $upstream_cache_status;\n"+
+			"    }\n"+
+			"}\n",
+		cacheSize, upstream,
+	)
+}
+
 // buildStatefulSet returns the StatefulSet spec for sc.
 func (r *ShardedCacheReconciler) buildStatefulSet(sc *cachev1alpha1.ShardedCache) *appsv1.StatefulSet {
 	lbls := shardLabels(sc)
 	n := sc.Spec.Shards
 	env := upstreamEnv(sc)
+	configMapName := sc.Name + "-nginx-config"
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: sc.Name, Namespace: sc.Namespace, Labels: lbls},
 		Spec: appsv1.StatefulSetSpec{
@@ -196,16 +277,31 @@ func (r *ShardedCacheReconciler) buildStatefulSet(sc *cachev1alpha1.ShardedCache
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: lbls},
 				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{{
+						Name: "nginx-config",
+						VolumeSource: corev1.VolumeSource{
+							ConfigMap: &corev1.ConfigMapVolumeSource{
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: configMapName,
+								},
+							},
+						},
+					}},
 					Containers: []corev1.Container{{
 						Name:      "cache",
 						Image:     defaultCacheImage,
-						Args:      argsForSize(sc.Spec.Size),
 						Env:       env,
 						Resources: resourcesForSize(sc.Spec.Size),
 						Ports: []corev1.ContainerPort{{
 							Name:          "cache",
 							ContainerPort: defaultCachePort,
 							Protocol:      corev1.ProtocolTCP,
+						}},
+						VolumeMounts: []corev1.VolumeMount{{
+							Name:      "nginx-config",
+							MountPath: "/etc/nginx/conf.d/default.conf",
+							SubPath:   "default.conf",
+							ReadOnly:  true,
 						}},
 					}},
 				},
@@ -271,19 +367,6 @@ func resourcesForSize(s cachev1alpha1.CacheSize) corev1.ResourceRequirements {
 				corev1.ResourceMemory: resource.MustParse("128Mi"),
 			},
 		}
-	}
-}
-
-// argsForSize returns the memcached command-line arguments that configure the
-// per-shard memory limit to match the chosen size tier.
-func argsForSize(s cachev1alpha1.CacheSize) []string {
-	switch s {
-	case cachev1alpha1.CacheSizeMedium:
-		return []string{"-m", "128"}
-	case cachev1alpha1.CacheSizeLarge:
-		return []string{"-m", "256"}
-	default: // CacheSizeSmall and any unset value
-		return []string{"-m", "64"}
 	}
 }
 
