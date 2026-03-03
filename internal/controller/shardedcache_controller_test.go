@@ -72,8 +72,8 @@ func TestReconcile_CreatesStatefulSetAndService(t *testing.T) {
 	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != shards {
 		t.Errorf("expected %d replicas, got %v", shards, sts.Spec.Replicas)
 	}
-	if got := sts.Spec.Template.Spec.Containers[0].Image; got != "redis:7" {
-		t.Errorf("expected default image redis:7, got %q", got)
+	if got := sts.Spec.Template.Spec.Containers[0].Image; got != "memcached:1" {
+		t.Errorf("expected default image memcached:1, got %q", got)
 	}
 
 	// Expect a headless Service.
@@ -408,5 +408,85 @@ func TestReconcile_BackendChangeUpdatesEnvVar(t *testing.T) {
 	want := "http://svc-b.default.svc.cluster.local:9001"
 	if upstream != want {
 		t.Errorf("CACHE_UPSTREAM after update = %q, want %q", upstream, want)
+	}
+}
+
+// TestReconcile_MemcachedPort validates that the headless Service and the
+// StatefulSet container both expose port 11211 (the memcached default).
+func TestReconcile_MemcachedPort(t *testing.T) {
+	const (
+		name = "porttest"
+		ns   = "default"
+	)
+	sc := sampleSC(name, ns, 1, cachev1alpha1.CacheSizeSmall)
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(sc).WithObjects(sc).Build()
+	r := &controller.ShardedCacheReconciler{Client: c, Scheme: scheme}
+	key := types.NamespacedName{Name: name, Namespace: ns}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var svc corev1.Service
+	if err := c.Get(context.Background(), key, &svc); err != nil {
+		t.Fatalf("Service not found: %v", err)
+	}
+	if len(svc.Spec.Ports) == 0 || svc.Spec.Ports[0].Port != 11211 {
+		t.Errorf("Service port = %v, want 11211", svc.Spec.Ports)
+	}
+
+	var sts appsv1.StatefulSet
+	if err := c.Get(context.Background(), key, &sts); err != nil {
+		t.Fatalf("StatefulSet not found: %v", err)
+	}
+	ctr := sts.Spec.Template.Spec.Containers[0]
+	if len(ctr.Ports) == 0 || ctr.Ports[0].ContainerPort != 11211 {
+		t.Errorf("container port = %v, want 11211", ctr.Ports)
+	}
+}
+
+// TestReconcile_MemcachedArgsForSize validates that each size tier produces
+// the correct -m (memory) argument for the memcached container.
+func TestReconcile_MemcachedArgsForSize(t *testing.T) {
+	tests := []struct {
+		size    cachev1alpha1.CacheSize
+		wantMem string
+	}{
+		{cachev1alpha1.CacheSizeSmall, "64"},
+		{cachev1alpha1.CacheSizeMedium, "128"},
+		{cachev1alpha1.CacheSizeLarge, "256"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(string(tt.size), func(t *testing.T) {
+			name := "argstest-" + string(tt.size)
+			ns := "default"
+			sc := sampleSC(name, ns, 1, tt.size)
+			scheme := newScheme(t)
+			c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(sc).WithObjects(sc).Build()
+			r := &controller.ShardedCacheReconciler{Client: c, Scheme: scheme}
+			key := types.NamespacedName{Name: name, Namespace: ns}
+
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+
+			var sts appsv1.StatefulSet
+			if err := c.Get(context.Background(), key, &sts); err != nil {
+				t.Fatalf("StatefulSet not found: %v", err)
+			}
+			args := sts.Spec.Template.Spec.Containers[0].Args
+			var gotMem string
+			for i, a := range args {
+				if a == "-m" && i+1 < len(args) {
+					gotMem = args[i+1]
+					break
+				}
+			}
+			if gotMem != tt.wantMem {
+				t.Errorf("size %s: memcached -m arg = %q, want %q", tt.size, gotMem, tt.wantMem)
+			}
+		})
 	}
 }

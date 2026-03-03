@@ -22,7 +22,10 @@ import (
 
 // defaultCacheImage is the container image used for every cache shard.
 // Users never need to specify an image; the operator manages this detail.
-const defaultCacheImage = "redis:7"
+const defaultCacheImage = "memcached:1"
+
+// defaultCachePort is the port exposed by each cache shard container.
+const defaultCachePort = int32(11211)
 
 // ShardedCacheReconciler watches ShardedCache objects and keeps child resources in sync.
 type ShardedCacheReconciler struct {
@@ -171,8 +174,8 @@ func (r *ShardedCacheReconciler) buildHeadlessService(sc *cachev1alpha1.ShardedC
 			Selector:  lbls,
 			Ports: []corev1.ServicePort{{
 				Name:       "cache",
-				Port:       6379,
-				TargetPort: intstr.FromInt32(6379),
+				Port:       defaultCachePort,
+				TargetPort: intstr.FromInt32(defaultCachePort),
 				Protocol:   corev1.ProtocolTCP,
 			}},
 		},
@@ -196,11 +199,12 @@ func (r *ShardedCacheReconciler) buildStatefulSet(sc *cachev1alpha1.ShardedCache
 					Containers: []corev1.Container{{
 						Name:      "cache",
 						Image:     defaultCacheImage,
+						Args:      argsForSize(sc.Spec.Size),
 						Env:       env,
 						Resources: resourcesForSize(sc.Spec.Size),
 						Ports: []corev1.ContainerPort{{
 							Name:          "cache",
-							ContainerPort: 6379,
+							ContainerPort: defaultCachePort,
 							Protocol:      corev1.ProtocolTCP,
 						}},
 					}},
@@ -267,6 +271,19 @@ func resourcesForSize(s cachev1alpha1.CacheSize) corev1.ResourceRequirements {
 				corev1.ResourceMemory: resource.MustParse("128Mi"),
 			},
 		}
+	}
+}
+
+// argsForSize returns the memcached command-line arguments that configure the
+// per-shard memory limit to match the chosen size tier.
+func argsForSize(s cachev1alpha1.CacheSize) []string {
+	switch s {
+	case cachev1alpha1.CacheSizeMedium:
+		return []string{"-m", "128"}
+	case cachev1alpha1.CacheSizeLarge:
+		return []string{"-m", "256"}
+	default: // CacheSizeSmall and any unset value
+		return []string{"-m", "64"}
 	}
 }
 
