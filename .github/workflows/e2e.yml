@@ -52,6 +52,13 @@ jobs:
           kubectl rollout status deployment/sharded-cache-operator-controller-manager \
             -n sharded-cache-operator-system --timeout=120s
 
+      - name: Deploy backend HTTP server
+        run: |
+          kubectl run backend --image=nginx:alpine --port=80 -n default \
+            --labels=app=backend
+          kubectl expose pod backend --port=80 --name=backend-svc -n default
+          kubectl wait --for=condition=Ready pod/backend -n default --timeout=60s
+
       - name: Create ShardedCache CR
         run: |
           kubectl apply -f - <<'EOF'
@@ -61,8 +68,12 @@ jobs:
             name: e2e-test
             namespace: default
           spec:
-            shards: 2
+            shards: 1
             size: small
+            backend:
+              kind: Service
+              name: backend-svc
+              port: 80
           EOF
 
       - name: Verify StatefulSet and Service are created
@@ -75,14 +86,85 @@ jobs:
           # Assert the StatefulSet exists with the correct shard count
           kubectl get statefulset e2e-test -n default
           REPLICAS=$(kubectl get statefulset e2e-test -n default -o jsonpath='{.spec.replicas}')
-          [ "$REPLICAS" = "2" ] || { echo "Expected 2 replicas, got $REPLICAS"; exit 1; }
+          [ "$REPLICAS" = "1" ] || { echo "Expected 1 replica, got $REPLICAS"; exit 1; }
           # Assert the headless Service exists
           kubectl get service e2e-test -n default
 
-      - name: Dump operator logs on failure
+      - name: Verify nginx HTTP proxy configuration
+        run: |
+          # Assert the container image is nginx:alpine
+          IMAGE=$(kubectl get statefulset e2e-test -n default \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          [ "$IMAGE" = "nginx:alpine" ] || { echo "Expected nginx:alpine, got $IMAGE"; exit 1; }
+          echo "Image OK: $IMAGE"
+
+          # Assert the container port is 80
+          PORT=$(kubectl get statefulset e2e-test -n default \
+            -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}')
+          [ "$PORT" = "80" ] || { echo "Expected port 80, got $PORT"; exit 1; }
+          echo "Container port OK: $PORT"
+
+          # Assert the headless Service exposes port 80
+          SVC_PORT=$(kubectl get service e2e-test -n default \
+            -o jsonpath='{.spec.ports[0].port}')
+          [ "$SVC_PORT" = "80" ] || { echo "Expected service port 80, got $SVC_PORT"; exit 1; }
+          echo "Service port OK: $SVC_PORT"
+
+          # Assert the nginx ConfigMap exists with proxy_pass to the backend
+          CM=$(kubectl get configmap e2e-test-nginx-config -n default \
+            -o jsonpath='{.data.default\.conf}')
+          echo "$CM" | grep -q 'proxy_pass' || \
+            { echo "Expected proxy_pass directive in nginx ConfigMap"; exit 1; }
+          echo "ConfigMap OK (proxy_pass present)"
+          echo "Nginx config:"
+          echo "$CM"
+
+      - name: Wait for nginx cache pods to be ready
+        run: kubectl rollout status statefulset/e2e-test -n default --timeout=180s
+
+      - name: Validate transparent HTTP caching
+        run: |
+          # Port-forward to the cache pod on HTTP port 80
+          kubectl port-forward -n default pod/e2e-test-0 8080:80 &
+          PF_PID=$!
+          trap "kill $PF_PID 2>/dev/null || true" EXIT
+          # Give the port-forward time to establish
+          sleep 3
+
+          # Helper: perform a GET and return "<http-code> <X-Cache-Status>"
+          http_get() {
+            RESP=$(curl -si http://127.0.0.1:8080/)
+            CODE=$(echo "$RESP" | head -1 | awk '{print $2}')
+            CACHE=$(echo "$RESP" | tr -d '\r' | grep -i '^X-Cache-Status:' | awk '{print $2}')
+            echo "$CODE ${CACHE:-none}"
+          }
+
+          # First request – cache miss (nginx proxies to backend and stores response)
+          read -r HTTP_CODE1 STATUS1 <<< "$(http_get)"
+          echo "First request:  HTTP $HTTP_CODE1, X-Cache-Status: $STATUS1"
+          [ "$HTTP_CODE1" = "200" ] || \
+            { echo "Expected HTTP 200 on first request, got $HTTP_CODE1"; exit 1; }
+
+          # Brief pause to ensure nginx has written the cache entry
+          sleep 1
+
+          # Second request – cache hit (nginx serves from local cache)
+          read -r HTTP_CODE2 STATUS2 <<< "$(http_get)"
+          echo "Second request: HTTP $HTTP_CODE2, X-Cache-Status: $STATUS2"
+          [ "$HTTP_CODE2" = "200" ] || \
+            { echo "Expected HTTP 200 on second request, got $HTTP_CODE2"; exit 1; }
+          [ "$STATUS2" = "HIT" ] || \
+            { echo "Expected X-Cache-Status: HIT on second request, got $STATUS2"; exit 1; }
+
+          echo "Transparent HTTP caching: PASS"
+
+      - name: Dump operator and cache logs on failure
         if: failure()
         run: |
           kubectl logs -l control-plane=controller-manager \
             -n sharded-cache-operator-system --tail=100 || true
           kubectl describe deployment sharded-cache-operator-controller-manager \
             -n sharded-cache-operator-system || true
+          kubectl logs -l app.kubernetes.io/instance=e2e-test \
+            -n default --tail=50 || true
+          kubectl describe statefulset e2e-test -n default || true
